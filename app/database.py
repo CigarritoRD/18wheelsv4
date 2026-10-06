@@ -38,12 +38,27 @@ def connection_failure(error):
         return 'DB_SERVICE_LIMIT: The database service reports a quota or availability restriction. Check the Neon project status and usage.'
     if any(part in detail for part in ('invalid connection option', 'invalid uri', 'invalid percent-encoded', 'missing "="', 'invalid integer value')):
         return 'DB_URL: DATABASE_URL could not be parsed. Paste only the full PostgreSQL URL, without a command, quotes or extra text.'
-    if any(part in detail for part in ('ssl', 'tls', 'certificate')):
-        return 'DB_SSL: The encrypted connection could not be established. Check the SSL parameters; keep sslmode=require in the Neon URL.'
     if any(part in detail for part in ('timeout', 'timed out')):
         return 'DB_TIMEOUT: The connection timed out. Check the Neon compute status, hostname and network availability, then retry.'
     if any(part in detail for part in ('connection refused', 'network is unreachable', 'no route to host')):
         return 'DB_NETWORK: The database endpoint could not be reached. Check the Neon hostname, port and compute status.'
+    # libpq may mention SSL even when the underlying failure is a timeout or
+    # a closed socket. Never treat the presence of "SSL" as a root cause.
+    signatures = (
+        ('DB_TLS_CERT', ('certificate verify failed', 'certificate has expired', 'self-signed certificate', 'unable to get local issuer'), 'TLS certificate verification failed.'),
+        ('DB_TLS_UNSUPPORTED', ('does not support ssl', 'ssl is not enabled', 'ssl support is not compiled'), 'The client or server does not support the requested encrypted connection.'),
+        ('DB_TLS_PROTOCOL', ('wrong version number', 'unsupported protocol', 'protocol version', 'no protocols available'), 'TLS protocol negotiation failed.'),
+        ('DB_TLS_CIPHER', ('no shared cipher', 'no ciphers available', 'dh key too small', 'ee key too small', 'legacy sigalg'), 'TLS cipher or signature negotiation failed.'),
+        ('DB_TLS_ALERT', ('handshake failure', 'tlsv1 alert', 'sslv3 alert', 'tls alert'), 'The peer rejected the TLS handshake.'),
+        ('DB_CONNECTION_CLOSED', ('eof detected', 'unexpected eof', 'closed the connection', 'connection reset', 'broken pipe', 'connection has been closed'), 'The remote connection closed unexpectedly during connection setup.'),
+        ('DB_TLS_SYSCALL', ('ssl syscall',), 'The TLS socket operation failed without a recognized close or timeout reason.'),
+        ('DB_TLS_NEGOTIATION', ('invalid response to ssl negotiation', 'received invalid response to ssl'), 'The endpoint returned an invalid PostgreSQL SSL negotiation response.'),
+    )
+    for code, fragments, explanation in signatures:
+        if any(fragment in detail for fragment in fragments):
+            return f'{code}: {explanation} Keep the Neon SSL parameters; check the endpoint and deployment settings.'
+    if any(part in detail for part in ('ssl', 'tls', 'certificate')):
+        return 'DB_SSL_UNKNOWN: The driver reported an unrecognized SSL-related failure. Keep sslmode=require; further driver diagnostics are needed.'
     if state == '28000' or any(part in detail for part in ('no pg_hba', 'role', 'access denied')):
         return 'DB_ACCESS: PostgreSQL rejected access for the configured role. Check the role and connection settings in Neon.'
     code = f' SQLSTATE={state}.' if isinstance(state, str) and re.fullmatch(r'[A-Z0-9]{5}', state) else ''
