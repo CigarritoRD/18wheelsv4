@@ -1,0 +1,34 @@
+31 offline browser assertions passed.
+Transport: FastAPI TestClient bridge; localStorage simulator.
+Not a live HTTP, browser-cookie, or native localStorage test.
+PASS: Initial administrator setup through API
+PASS: Initial administrator screen
+PASS: New accounts default to Requester
+PASS: Exactly three selectable roles
+PASS: New accounts default to Requester
+PASS: Exactly three selectable roles
+PASS: Administrator can create unassigned jobs
+PASS: Requester has no team controls
+PASS: Requester does not see unrelated jobs
+PASS: Requester form has no assignment or status controls
+PASS: Requester status is read-only
+PASS: Requester cannot edit job details
+PASS: Requester cannot label repair completion photos
+PASS: Only active technicians appear as assignees
+PASS: Admin sees original requester
+PASS: Technician cannot create jobs
+PASS: Technician cannot manage accounts
+PASS: Technician sees only assigned job
+PASS: Requester sees before and after photos
+PASS: Completed request still read-only for requester
+PASS: Requester sees technician completion notes
+PASS: Requester detail fits mobile viewport
+PASS: Requester dashboard fits mobile viewport
+PASS: Technician detail fits mobile viewport
+PASS: No real-app JavaScript runtime errors
+PASS: Preview has all three role buttons
+PASS: Preview requester sees only own sample requests
+PASS: Preview requester cannot change completion status
+PASS: Preview state survives a fresh document using a storage simulator
+PASS: Preview role controls fit mobile viewport
+PASS: No preview JavaScript runtime errors

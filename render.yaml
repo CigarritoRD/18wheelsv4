@@ -1,0 +1,32 @@
+# Connect this repository as a Render Blueprint, or follow docs/RENDER_SETUP_ES.md.
+# Secrets are requested by Render and never belong in this file.
+services:
+  - type: web
+    name: 18wheelers-jobs
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: EW_HOST
+        value: 0.0.0.0
+      - key: EW_DATA_DIR
+        value: /data
+      - key: EW_SECURE_COOKIES
+        value: "1"
+      - key: EW_PHOTO_STORAGE
+        value: r2
+      - key: EW_R2_URL_TTL_SECONDS
+        value: "60"
+      - key: DATABASE_URL
+        sync: false
+      - key: EW_R2_BUCKET
+        sync: false
+      - key: EW_R2_ENDPOINT_URL
+        sync: false
+      - key: EW_R2_ACCESS_KEY_ID
+        sync: false
+      - key: EW_R2_SECRET_ACCESS_KEY
+        sync: false
