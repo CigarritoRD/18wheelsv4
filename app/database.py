@@ -15,6 +15,41 @@ INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
 WRITE_LOCK = 187336201
 
 
+def connection_failure(error):
+    """Classify driver failures; never copy driver text/credentials to logs.
+
+    libpq connection errors often have no SQLSTATE, so fixed message fragments
+    are a fallback. All emitted text is application-owned, even if the server
+    sends an error containing a URL, password or arbitrary remote text.
+    """
+    state = getattr(error, 'sqlstate', None)
+    detail = str(error).lower()
+    if state == '28P01' or 'password authentication failed' in detail:
+        return 'DB_AUTH: PostgreSQL rejected the username/password. Copy a fresh Neon connection URL with the actual password into DATABASE_URL.'
+    if 'channel binding' in detail:
+        return 'DB_CHANNEL_BINDING: The connection failed its channel-binding requirement. Check the SSL parameters in the Neon connection URL.'
+    if any(part in detail for part in ('could not translate host name', 'name or service not known', 'name resolution', 'nodename nor servname')):
+        return 'DB_DNS: The database hostname could not be resolved. Check that DATABASE_URL contains the exact Neon hostname.'
+    if state == '3D000' or ('database' in detail and 'does not exist' in detail):
+        return 'DB_DATABASE: The requested database does not exist. Copy the URL for the correct database from Neon Connect.'
+    if state == '53300' or any(part in detail for part in ('too many connections', 'too many clients', 'remaining connection slots')):
+        return 'DB_CONNECTION_LIMIT: PostgreSQL has reached its connection limit. Use the Neon pooled URL and check active connections.'
+    if any(part in detail for part in ('quota', 'compute time', 'endpoint is disabled', 'compute is disabled', 'suspended')):
+        return 'DB_SERVICE_LIMIT: The database service reports a quota or availability restriction. Check the Neon project status and usage.'
+    if any(part in detail for part in ('invalid connection option', 'invalid uri', 'invalid percent-encoded', 'missing "="', 'invalid integer value')):
+        return 'DB_URL: DATABASE_URL could not be parsed. Paste only the full PostgreSQL URL, without a command, quotes or extra text.'
+    if any(part in detail for part in ('ssl', 'tls', 'certificate')):
+        return 'DB_SSL: The encrypted connection could not be established. Check the SSL parameters; keep sslmode=require in the Neon URL.'
+    if any(part in detail for part in ('timeout', 'timed out')):
+        return 'DB_TIMEOUT: The connection timed out. Check the Neon compute status, hostname and network availability, then retry.'
+    if any(part in detail for part in ('connection refused', 'network is unreachable', 'no route to host')):
+        return 'DB_NETWORK: The database endpoint could not be reached. Check the Neon hostname, port and compute status.'
+    if state == '28000' or any(part in detail for part in ('no pg_hba', 'role', 'access denied')):
+        return 'DB_ACCESS: PostgreSQL rejected access for the configured role. Check the role and connection settings in Neon.'
+    code = f' SQLSTATE={state}.' if isinstance(state, str) and re.fullmatch(r'[A-Z0-9]{5}', state) else ''
+    return 'DB_CONNECT: PostgreSQL connection failed. Check DATABASE_URL and the Neon project status.' + code
+
+
 class Row(dict):
     """Named columns with positional access for existing aggregate queries."""
     def __getitem__(self, key):
@@ -85,8 +120,8 @@ class Database:
             try:
                 conn = psycopg.connect(self.url, connect_timeout=15, row_factory=row_factory,
                                        prepare_threshold=None)
-            except psycopg.Error:
-                raise RuntimeError('Cannot connect to PostgreSQL. Check DATABASE_URL in your hosting settings.') from None
+            except psycopg.Error as error:
+                raise RuntimeError(connection_failure(error)) from None
             with conn:
                 conn.execute("SET LOCAL statement_timeout = '20s'")
                 conn.execute("SET LOCAL lock_timeout = '15s'")
