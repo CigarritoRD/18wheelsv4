@@ -34,8 +34,6 @@ def main():
             db.execute('DELETE FROM sessions WHERE user_id=?',(account['id'],))
         print('Password reset. The user must change it on their next login.')
     else:
-        if os.environ.get('DATABASE_URL', '').strip():
-            raise SystemExit('For PostgreSQL use pg_dump with DATABASE_URL, and back up R2 separately. This command only backs up SQLite.')
         # Backups must not initialize the app or run a schema migration first.
         store=Path(os.environ.get('EW_DATA_DIR',Path(__file__).resolve().parent/'data')).resolve()
         if not (store/'jobs.sqlite3').is_file():
@@ -49,7 +47,7 @@ def main():
         source=sqlite3.connect(store/'jobs.sqlite3')
         target=sqlite3.connect(snapshot)
         try:
-            with target:source.backup(target)
+            source.backup(target)
         finally:
             target.close()
             source.close()

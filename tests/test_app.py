@@ -179,6 +179,31 @@ def test_photos_authorization_and_metadata_removal(workspace):
     assert upload(other,job['id']).status_code==404
 
 
+def test_external_photo_store_keeps_objects_private(tmp_path):
+    class MemoryPhotoStore:
+        kind='memory'
+        def __init__(self):self.objects={}
+        def put(self,key,content):self.objects[key]=content
+        def get(self,key):return self.objects.get(key)
+        def delete(self,key):self.objects.pop(key,None)
+
+    store=MemoryPhotoStore()
+    app=create_app(tmp_path,photo_store=store)
+    client=TestClient(app)
+    token=(tmp_path/'.setup-token').read_text()
+    result=send(client,'POST','/api/setup',{'name':'Manager','email':'manager@example.test','password':ADMIN_PASSWORD,'setup_token':token})
+    assert result.status_code==200,result.text
+    job=new_job(client)
+    assert upload(client,job['id']).status_code==200
+    photo=client.get(f'/api/jobs/{job["id"]}').json()['photos'][0]
+    assert len(store.objects)==1 and next(iter(store.objects)).endswith('.jpg')
+    assert not list((tmp_path/'uploads').iterdir())
+    assert TestClient(app).get(photo['url']).status_code==401
+    assert client.get(photo['url']).status_code==200
+    assert send(client,'DELETE',f'/api/photos/{photo["id"]}').status_code==200
+    assert store.objects=={}
+
+
 def test_fake_image_rejected_atomically(workspace):
     _,client,_=workspace;job=new_job(client)
     assert upload(client,job['id'],b'<svg onload="evil()"></svg>','x.jpg').status_code==400

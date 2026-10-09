@@ -1,5 +1,4 @@
-# Connect this repository as a Render Blueprint, or follow docs/RENDER_SETUP_ES.md.
-# Secrets are requested by Render and never belong in this file.
+# Deploy the local three-role project, not the previous repository backend.
 services:
   - type: web
     name: 18wheelers-jobs
@@ -18,10 +17,10 @@ services:
         value: "1"
       - key: EW_DB_SCHEMA
         value: app_private
+      - key: EW_DB_POOL_SIZE
+        value: "3"
       - key: EW_PHOTO_STORAGE
         value: r2
-      - key: EW_R2_URL_TTL_SECONDS
-        value: "60"
       - key: DATABASE_URL
         sync: false
       - key: EW_R2_BUCKET

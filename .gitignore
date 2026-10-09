@@ -5,6 +5,6 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .env
-.tmp/
 .tool-state/
+.tmp/
 supabase/.temp/

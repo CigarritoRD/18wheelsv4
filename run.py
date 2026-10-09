@@ -1,4 +1,4 @@
-"""Launch locally or behind an HTTPS reverse proxy. No cloud service is required."""
+"""Launch locally or as a hosted FastAPI service."""
 import argparse
 import os
 import threading
@@ -24,10 +24,17 @@ def main():
         url+='/?setup_token='+token
     print('\n18WHEELERS JOBS\n'+'='*42)
     print('Workspace: '+local)
-    print('Data directory: '+str(app.state.store))
+    print('Database: '+app.state.database.backend)
+    print('Photo storage: '+app.state.photo_store.kind)
+    if app.state.database.backend=='sqlite':
+        print('Data directory: '+str(app.state.store))
     if first_run:
-        print('\nFIRST-TIME SETUP (private link):\n'+url)
-        print('On an HTTPS host, replace the local address with your HTTPS domain.')
+        if os.environ.get('EW_SETUP_TOKEN'):
+            print('\nFIRST-TIME SETUP: open /?setup_token=<EW_SETUP_TOKEN> on your HTTPS domain.')
+            print('The configured token is intentionally not written to application logs.')
+        else:
+            print('\nFIRST-TIME SETUP (private link):\n'+url)
+            print('On an HTTPS host, replace the local address with your HTTPS domain.')
     if args.host not in ('localhost','127.0.0.1','::1'):
         print('\nShared deployment: use HTTPS, EW_SECURE_COOKIES=1, and the deployment guide.')
     print('\nKeep this window open while using the app. Press Ctrl+C to stop.\n')

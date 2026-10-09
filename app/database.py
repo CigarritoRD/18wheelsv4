@@ -1,153 +1,157 @@
-"""Small database boundary: SQLite locally, PostgreSQL when DATABASE_URL is set.
+"""Database backends for local SQLite and hosted Supabase Postgres."""
+from __future__ import annotations
 
-Only application-authored SQL crosses this boundary. Values always remain bound
-parameters. PostgreSQL transactions use transaction-scoped advisory locks for
-the operations that require the same serialization as SQLite BEGIN IMMEDIATE.
-"""
-from contextlib import contextmanager
 import os
 import re
 import sqlite3
-
-import psycopg
-
-INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
-WRITE_LOCK = 187336201
+from contextlib import contextmanager
+from pathlib import Path
 
 
-def connection_failure(error):
-    """Classify driver failures; never copy driver text/credentials to logs.
+try:  # Optional during a local-only install; required when DATABASE_URL is set.
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+except ImportError:  # pragma: no cover - exercised only in intentionally minimal installs.
+    psycopg = None
+    dict_row = None
+    ConnectionPool = None
 
-    libpq connection errors often have no SQLSTATE, so fixed message fragments
-    are a fallback. All emitted text is application-owned, even if the server
-    sends an error containing a URL, password or arbitrary remote text.
-    """
-    state = getattr(error, 'sqlstate', None)
+
+if psycopg:
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+
+
+def connection_failure(error) -> str:
+    """Emit only fixed diagnostics: driver messages can contain credentials."""
     detail = str(error).lower()
-    if state == '28P01' or 'password authentication failed' in detail:
-        return 'DB_AUTH: PostgreSQL rejected the username/password. Copy the Supabase Session pooler URL with the actual encoded password into DATABASE_URL.'
-    if 'channel binding' in detail:
-        return 'DB_CHANNEL_BINDING: The connection failed its channel-binding requirement. Check the SSL parameters in DATABASE_URL.'
-    if any(part in detail for part in ('could not translate host name', 'name or service not known', 'name resolution', 'nodename nor servname')):
-        return 'DB_DNS: The database hostname could not be resolved. Check that DATABASE_URL contains the exact Supabase pooler hostname.'
-    if state == '3D000' or ('database' in detail and 'does not exist' in detail):
-        return 'DB_DATABASE: The requested database does not exist. Copy the URL for the correct database from Supabase Connect.'
-    if state == '53300' or any(part in detail for part in ('too many connections', 'too many clients', 'remaining connection slots')):
-        return 'DB_CONNECTION_LIMIT: PostgreSQL has reached its connection limit. Use the Supabase pooler URL and check active connections.'
-    if any(part in detail for part in ('quota', 'compute time', 'endpoint is disabled', 'compute is disabled', 'suspended')):
-        return 'DB_SERVICE_LIMIT: The database service reports a quota or availability restriction. Check the Supabase project status and usage.'
-    if any(part in detail for part in ('invalid connection option', 'invalid uri', 'invalid percent-encoded', 'missing "="', 'invalid integer value')):
-        return 'DB_URL: DATABASE_URL could not be parsed. Paste only the full PostgreSQL URL, without a command, quotes or extra text.'
-    if any(part in detail for part in ('timeout', 'timed out')):
-        return 'DB_TIMEOUT: The connection timed out. Check the Supabase project status, hostname and network availability, then retry.'
-    if any(part in detail for part in ('connection refused', 'network is unreachable', 'no route to host')):
-        return 'DB_NETWORK: The database endpoint could not be reached. Check the Supabase pooler hostname, port and project status.'
-    # libpq may mention SSL even when the underlying failure is a timeout or
-    # a closed socket. Never treat the presence of "SSL" as a root cause.
+    state = getattr(error, 'sqlstate', None)
     signatures = (
-        ('DB_TLS_CERT', ('certificate verify failed', 'certificate has expired', 'self-signed certificate', 'unable to get local issuer'), 'TLS certificate verification failed.'),
-        ('DB_TLS_UNSUPPORTED', ('does not support ssl', 'ssl is not enabled', 'ssl support is not compiled'), 'The client or server does not support the requested encrypted connection.'),
-        ('DB_TLS_PROTOCOL', ('wrong version number', 'unsupported protocol', 'protocol version', 'no protocols available'), 'TLS protocol negotiation failed.'),
-        ('DB_TLS_CIPHER', ('no shared cipher', 'no ciphers available', 'dh key too small', 'ee key too small', 'legacy sigalg'), 'TLS cipher or signature negotiation failed.'),
-        ('DB_TLS_ALERT', ('handshake failure', 'tlsv1 alert', 'sslv3 alert', 'tls alert'), 'The peer rejected the TLS handshake.'),
-        ('DB_CONNECTION_CLOSED', ('eof detected', 'unexpected eof', 'closed the connection', 'connection reset', 'broken pipe', 'connection has been closed'), 'The remote connection closed unexpectedly during connection setup.'),
-        ('DB_TLS_SYSCALL', ('ssl syscall',), 'The TLS socket operation failed without a recognized close or timeout reason.'),
-        ('DB_TLS_NEGOTIATION', ('invalid response to ssl negotiation', 'received invalid response to ssl'), 'The endpoint returned an invalid PostgreSQL SSL negotiation response.'),
+        ('DB_AUTH', ('password authentication failed',), 'The database rejected the credentials.'),
+        ('DB_URL', ('invalid sslmode value', 'invalid connection option', 'invalid uri', 'invalid percent-encoded'), 'The database URL contains an invalid option or encoding.'),
+        ('DB_TLS_CERT', ('certificate verify failed', 'certificate has expired', 'self-signed certificate', 'does not match host name'), 'TLS certificate verification failed.'),
+        ('DB_TLS_INTERNAL', ('alert internal error',), 'The database endpoint sent a TLS internal-error alert.'),
+        ('DB_TLS_RECORD', ('bad record mac', 'decryption failed'), 'TLS record verification failed.'),
+        ('DB_CONNECTION_CLOSED', ('ssl connection has been closed unexpectedly', 'eof detected', 'connection reset', 'unexpected eof', 'closed the connection'), 'The endpoint closed the connection during startup.'),
+        ('DB_TLS_PROTOCOL', ('wrong version number', 'unsupported protocol', 'handshake failure'), 'TLS negotiation failed.'),
+        ('DB_DNS', ('could not translate host name', 'name or service not known', 'name resolution'), 'The database hostname could not be resolved.'),
+        ('DB_DATABASE', ('does not exist',), 'The requested database or role does not exist.'),
+        ('DB_TIMEOUT', ('timeout', 'timed out'), 'The database connection timed out.'),
+        ('DB_NETWORK', ('connection refused', 'network is unreachable', 'no route to host'), 'The database endpoint could not be reached.'),
+        ('DB_ACCESS', ('tenant or user not found', 'no pg_hba'), 'The database rejected the project or user.'),
     )
     for code, fragments, explanation in signatures:
         if any(fragment in detail for fragment in fragments):
-            return f'{code}: {explanation} Keep the PostgreSQL SSL parameters; check the endpoint and deployment settings.'
-    if any(part in detail for part in ('ssl', 'tls', 'certificate')):
-        return 'DB_SSL_UNKNOWN: The driver reported an unrecognized SSL-related failure. Keep sslmode=require; further driver diagnostics are needed.'
-    if state == '28000' or any(part in detail for part in ('no pg_hba', 'role', 'access denied')):
-        return 'DB_ACCESS: PostgreSQL rejected access for the configured role. Check the role and connection settings in Supabase.'
-    code = f' SQLSTATE={state}.' if isinstance(state, str) and re.fullmatch(r'[A-Z0-9]{5}', state) else ''
-    return 'DB_CONNECT: PostgreSQL connection failed. Check DATABASE_URL and the Supabase project status.' + code
+            return code + ': ' + explanation + ' Keep SSL enabled; check Supabase Connect.'
+    suffix = ' SQLSTATE=' + state if isinstance(state, str) and re.fullmatch(r'[A-Z0-9]{5}', state) else ''
+    return 'DB_CONNECT: Database connection failed; no raw driver message is logged.' + suffix
 
 
-class Row(dict):
-    """Named columns with positional access for existing aggregate queries."""
+if psycopg:
+    class SafePostgresConnection(psycopg.Connection):
+        @classmethod
+        def connect(cls, *args, **kwargs):
+            try:
+                return super().connect(*args, **kwargs)
+            except psycopg.Error as error:
+                # Pool reconnect warnings must never log arbitrary server text.
+                raise psycopg.OperationalError(connection_failure(error)) from None
+
+
+class PostgresCursor:
+    """Small compatibility layer for the sqlite Row/Cursor API used by the app."""
+
+    def __init__(self, cursor=None):
+        self.cursor = cursor
+
+    @staticmethod
+    def _row(row):
+        return FlexibleRow(row) if row is not None else None
+
+    def fetchone(self):
+        return self._row(self.cursor.fetchone()) if self.cursor else None
+
+    def fetchall(self):
+        return [self._row(row) for row in self.cursor.fetchall()] if self.cursor else []
+
+    def __iter__(self):
+        if not self.cursor:
+            return iter(())
+        return (self._row(row) for row in self.cursor)
+
+
+class FlexibleRow(dict):
+    """Mapping row that also accepts numeric indexes like sqlite3.Row."""
+
     def __getitem__(self, key):
         if isinstance(key, int):
+            return tuple(self.values())[key]
+        if isinstance(key, slice):
             return tuple(self.values())[key]
         return super().__getitem__(key)
 
 
-def row_factory(cursor):
-    names = [column.name for column in cursor.description] if cursor.description else []
-    return lambda values: Row(zip(names, values))
-
-
-def postgres_query(query):
-    # Preserve quoted SQL literals/identifiers, including escaped quotes. The
-    # application's SQL contains no comments, dollar quotes or JSON operators.
-    tokens = re.split(r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")", query)
-    return ''.join(part.replace('%', '%%') if i % 2 else part.replace('%', '%%').replace('?', '%s')
-                   for i, part in enumerate(tokens))
-
-
 class PostgresConnection:
-    dialect = 'postgres'
-
     def __init__(self, connection):
         self.connection = connection
 
-    def execute(self, query, parameters=None):
-        if parameters is None:
-            return self.connection.execute(query)
-        return self.connection.execute(postgres_query(query), parameters)
+    @staticmethod
+    def _sql(statement: str) -> str:
+        tokens = re.split(r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")", statement)
+        return ''.join(part.replace('%', '%%') if index % 2 else
+                       part.replace('%', '%%').replace('?', '%s')
+                       for index, part in enumerate(tokens))
 
-    def executemany(self, query, parameters):
-        cursor = self.connection.cursor()
-        cursor.executemany(postgres_query(query), parameters)
-        return cursor
-
-
-def write_lock(conn):
-    if getattr(conn, 'dialect', 'sqlite') == 'postgres':
-        conn.execute('SELECT pg_advisory_xact_lock(?)', (WRITE_LOCK,))
-    else:
-        conn.execute('BEGIN IMMEDIATE')
-
-
-def photo_columns(conn):
-    if getattr(conn, 'dialect', 'sqlite') == 'postgres':
-        return {row[0] for row in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='photos'")}
-    return {row['name'] for row in conn.execute('PRAGMA table_info(photos)')}
+    def execute(self, statement: str, parameters=None):
+        if statement.strip().upper() == 'BEGIN IMMEDIATE':
+            # The pool context already owns a Postgres transaction. SQLite needs
+            # this explicit lock; Postgres row updates provide the concurrency.
+            return PostgresCursor()
+        cursor = (self.connection.execute(statement) if parameters is None else
+                  self.connection.execute(self._sql(statement), parameters))
+        return PostgresCursor(cursor)
 
 
 class Database:
-    def __init__(self, path):
-        self.path = path
-        self.url = os.environ.get('DATABASE_URL', '').strip()
-        self.backend = 'postgres' if self.url else 'sqlite'
-        self.schema = os.environ.get('EW_DB_SCHEMA', 'app_private' if os.environ.get('RENDER') == 'true' else '').strip()
-        if self.schema and self.schema != 'app_private':
-            raise ValueError('EW_DB_SCHEMA must be app_private or unset.')
-        if self.url and not self.url.startswith(('postgresql://', 'postgres://')):
-            raise ValueError('DATABASE_URL must be a PostgreSQL connection URL.')
-        if os.environ.get('RENDER') == 'true':
-            if not self.url:
-                raise ValueError('Render requires DATABASE_URL. SQLite on the local disk is not persistent.')
-            if os.environ.get('EW_PHOTO_STORAGE', 'local') != 'r2':
-                raise ValueError('Render requires EW_PHOTO_STORAGE=r2 to preserve uploaded photos.')
+    """Select SQLite for local use or Supabase Postgres via DATABASE_URL."""
+
+    def __init__(self, sqlite_path: Path, database_url: str | None = None):
+        self.sqlite_path = sqlite_path
+        self.database_url = database_url
+        self.backend = 'postgres' if database_url else 'sqlite'
+        self.pool = None
+        if os.environ.get('RENDER') == 'true' and not database_url:
+            raise RuntimeError('Render requires DATABASE_URL; SQLite on the local disk is not persistent.')
+        if self.backend == 'postgres':
+            if not psycopg or not ConnectionPool:
+                raise RuntimeError(
+                    'DATABASE_URL is set, but Postgres dependencies are missing. '
+                    'Install requirements.txt before starting the app.'
+                )
+            pool_size = int(os.environ.get('EW_DB_POOL_SIZE', '5'))
+            if not 1 <= pool_size <= 20:
+                raise RuntimeError('EW_DB_POOL_SIZE must be between 1 and 20.')
+            self.pool = ConnectionPool(
+                conninfo=database_url,
+                min_size=1,
+                max_size=pool_size,
+                connection_class=SafePostgresConnection,
+                kwargs={'row_factory': dict_row, 'prepare_threshold': None, 'connect_timeout': 10},
+                open=False,
+            )
+            self.pool.open()
+            try:
+                self.pool.wait(timeout=15)
+            except Exception:
+                self.pool.close()
+                raise RuntimeError('DB_STARTUP: The Postgres pool could not start. See the safe DB_* diagnostics above.') from None
 
     @contextmanager
-    def __call__(self):
-        if self.backend == 'postgres':
-            try:
-                conn = psycopg.connect(self.url, connect_timeout=15, row_factory=row_factory,
-                                       prepare_threshold=None)
-            except psycopg.Error as error:
-                raise RuntimeError(connection_failure(error)) from None
-            with conn:
-                if self.schema:
-                    conn.execute('SET LOCAL search_path TO app_private, pg_catalog')
-                conn.execute("SET LOCAL statement_timeout = '20s'")
-                conn.execute("SET LOCAL lock_timeout = '15s'")
-                yield PostgresConnection(conn)
-        else:
-            conn = sqlite3.connect(self.path, timeout=20)
+    def connection(self):
+        if self.backend == 'sqlite':
+            conn = sqlite3.connect(self.sqlite_path, timeout=20)
             conn.row_factory = sqlite3.Row
             conn.execute('PRAGMA foreign_keys=ON')
             conn.execute('PRAGMA busy_timeout=20000')
@@ -156,38 +160,26 @@ class Database:
                     yield conn
             finally:
                 conn.close()
+            return
 
-    def initialize(self, schema, migrate_roles, store, setup_file):
-        if self.backend == 'sqlite':
-            with self() as conn:
-                conn.execute('PRAGMA journal_mode=WAL')
-                conn.executescript(schema)
-                migrate_roles(conn, store)
-            if not setup_file.exists():
-                import secrets
-                try:
-                    fd = os.open(setup_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                    with os.fdopen(fd, 'w') as file:
-                        file.write(secrets.token_urlsafe(32))
-                except FileExistsError:
-                    pass
-            return setup_file.read_text().strip()
+        with self.pool.connection() as raw:
+            # The schema is deliberately outside Supabase's exposed `public`
+            # schema. Keep this transaction-scoped so pooled connections cannot
+            # leak session state between applications.
+            raw.execute('SET LOCAL search_path TO app_private, pg_catalog')
+            yield PostgresConnection(raw)
 
-        import secrets
-        schema = schema.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY')
-        schema = re.sub(r'\bREAL\b', 'DOUBLE PRECISION', schema)
-        with self() as conn:
-            write_lock(conn)
-            if self.schema:
-                required = ('users', 'sessions', 'attempts', 'jobs', 'photos', 'activity',
-                            'notifications', 'app_settings', 'photo_reservations', 'photo_counters')
-                for table in required:
-                    if conn.execute('SELECT to_regclass(?)', ('app_private.' + table,)).fetchone()[0] is None:
-                        raise RuntimeError('Apply the Supabase migrations before starting the server.')
-            else:
-                for statement in schema.split(';'):
-                    if statement.strip():
-                        conn.execute(statement)
-                conn.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-            conn.execute("INSERT INTO app_settings(key,value) VALUES ('setup_token',?) ON CONFLICT(key) DO NOTHING", (secrets.token_urlsafe(32),))
-            return conn.execute("SELECT value FROM app_settings WHERE key='setup_token'").fetchone()[0]
+    def check_postgres_schema(self):
+        if self.backend != 'postgres':
+            return
+        with self.pool.connection() as raw:
+            row = raw.execute("SELECT to_regclass('app_private.users') AS table_name").fetchone()
+            if not row or not row['table_name']:
+                raise RuntimeError(
+                    'Supabase is reachable, but the app schema is missing. '
+                    'Apply the files in supabase/migrations before starting the server.'
+                )
+
+    def close(self):
+        if self.pool:
+            self.pool.close()

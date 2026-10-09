@@ -1,9 +1,8 @@
 """18wheelers Jobs: a small-team job and photo workflow with private accounts.
 
-Database uses SQLite in EW_DATA_DIR or PostgreSQL through DATABASE_URL;
-photos use local storage or a private R2 bucket.
-Run with run.py. All SQL values are parameterized; account and photo authorization
-is enforced on the server, independently of the browser interface.
+Local development uses SQLite and private disk storage. Hosted deployments can
+use Supabase Postgres and Cloudflare R2. All SQL values are parameterized; account
+and photo authorization is enforced by the server, independently of the browser.
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import re
 import secrets
 import sqlite3
 import time
+import warnings
 from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Any
@@ -24,12 +24,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.datastructures import UploadFile
-from starlette.concurrency import run_in_threadpool
-from app.photo_storage import PhotoStorage, PhotoMissing, StorageUnavailable
-from app.photo_processing import compress_photo
-from app.photo_limits import PhotoLimits
-from app.database import Database, INTEGRITY_ERRORS, write_lock
+
+from app.database import Database, INTEGRITY_ERRORS
+from app.photo_storage import LocalPhotoStore, create_photo_store
 
 ROOT = Path(__file__).resolve().parent
 ROLES = ('admin', 'technician', 'requester')
@@ -41,6 +40,7 @@ CATEGORIES = ('Maintenance', 'Inspection', 'Delivery', 'Yard', 'Office', 'Other'
 MAX_BODY = 32 * 1024 * 1024
 MAX_PHOTO = 12 * 1024 * 1024
 SESSION_SECONDS = 12 * 60 * 60
+Image.MAX_IMAGE_PIXELS = 24_000_000
 
 
 def utcnow() -> str:
@@ -223,39 +223,61 @@ class BodyLimitMiddleware:
         await self.app(scope, limited_receive, send)
 
 
-def create_app(data_dir: str | Path | None = None) -> FastAPI:
+def create_app(
+    data_dir: str | Path | None = None,
+    *,
+    database_url: str | None = None,
+    photo_store=None,
+) -> FastAPI:
     store = Path(data_dir or os.environ.get('EW_DATA_DIR', ROOT.parent / 'data')).resolve()
     store.mkdir(parents=True, exist_ok=True)
     uploads = store / 'uploads'
     uploads.mkdir(exist_ok=True)
-    photo_storage = PhotoStorage(uploads)
     db_path = store / 'jobs.sqlite3'
     secure_cookie = os.environ.get('EW_SECURE_COOKIES', '0') == '1'
     setup_file = store / '.setup-token'
-    db = Database(db_path)
-    setup_token = db.initialize(SCHEMA, migrate_roles, store, setup_file)
+    configured_setup_token = os.environ.get('EW_SETUP_TOKEN', '').strip()
+    if configured_setup_token and len(configured_setup_token) < 32:
+        raise RuntimeError('EW_SETUP_TOKEN must contain at least 32 characters.')
+    if not configured_setup_token and not setup_file.exists():
+        try:
+            fd = os.open(setup_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                f.write(secrets.token_urlsafe(32))
+        except FileExistsError:
+            pass
+    setup_token = configured_setup_token or setup_file.read_text().strip()
 
-    photo_limits = PhotoLimits(db, uploads)
+    selected_database_url = database_url
+    if selected_database_url is None and data_dir is None:
+        selected_database_url = os.environ.get('DATABASE_URL', '').strip() or None
+    database = Database(db_path, selected_database_url)
+    db = database.connection
+    if database.backend == 'sqlite':
+        with db() as conn:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.executescript(SCHEMA)
+            migrate_roles(conn, store)
+    else:
+        database.check_postgres_schema()
+
+    if photo_store is None:
+        # Explicit local/test directories stay isolated from any cloud secrets in
+        # the developer's shell.
+        photo_store = LocalPhotoStore(uploads) if data_dir is not None else create_photo_store(uploads)
 
     app = FastAPI(title='18wheelers Jobs', docs_url=None, redoc_url=None, openapi_url=None)
     app.state.db = db
+    app.state.database = database
+    app.state.photo_store = photo_store
     app.state.store = store
     app.state.setup_token = setup_token
-    app.state.photo_storage = photo_storage
-    app.state.photo_limits = photo_limits
+    app.add_event_handler('shutdown', database.close)
     app.add_middleware(BodyLimitMiddleware)
 
     @app.exception_handler(HTTPException)
     async def api_error(request, exc):
         return JSONResponse({'error': exc.detail}, status_code=exc.status_code, headers=exc.headers)
-
-    @app.exception_handler(StorageUnavailable)
-    async def storage_error(request, exc):
-        return JSONResponse({'error': 'Photo storage is temporarily unavailable. Please try again.'}, status_code=503)
-
-    @app.exception_handler(PhotoMissing)
-    async def missing_photo(request, exc):
-        return JSONResponse({'error': str(exc)}, status_code=404)
 
     @app.middleware('http')
     async def security_headers(request: Request, call_next):
@@ -263,8 +285,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'no-referrer'
-        image_sources = "'self' blob: data:" + (' ' + photo_storage.image_origin if photo_storage.image_origin else '')
-        response.headers['Content-Security-Policy'] = f"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src {image_sources}; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
         response.headers['Permissions-Policy'] = 'geolocation=(), microphone=()'
         if secure_cookie:
             response.headers['Strict-Transport-Security'] = 'max-age=31536000'
@@ -283,11 +304,12 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     def new_session(user_id: int | None, response: Response, old_request: Request):
         raw, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        old_raw = old_request.cookies.get('ew_session', '')
+        old_hash = hashlib.sha256(old_raw.encode()).hexdigest() if old_raw else None
         with db() as conn:
             conn.execute('DELETE FROM sessions WHERE expires < ?', (time.time(),))
-            old = current_session(old_request)
-            if old:
-                conn.execute('DELETE FROM sessions WHERE token_hash=?', (old['token_hash'],))
+            if old_hash:
+                conn.execute('DELETE FROM sessions WHERE token_hash=?', (old_hash,))
             conn.execute('INSERT INTO sessions VALUES (?,?,?,?)', (hashlib.sha256(raw.encode()).hexdigest(), user_id, csrf, time.time() + (SESSION_SECONDS if user_id else 1800)))
         response.set_cookie('ew_session', raw, max_age=SESSION_SECONDS if user_id else 1800, httponly=True, secure=secure_cookie, samesite='lax', path='/')
         return csrf
@@ -319,8 +341,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     def safe_user(row):
         return {key: row[key] for key in ('id', 'name', 'email', 'role', 'active', 'must_change', 'created_at')}
 
-    def job_access(conn, job_id: int, actor):
-        row = conn.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+    def job_access(conn, job_id: int, actor, lock: bool = False):
+        suffix = ' FOR UPDATE' if lock and database.backend == 'postgres' else ''
+        row = conn.execute('SELECT * FROM jobs WHERE id=?' + suffix, (job_id,)).fetchone()
         allowed = row and (
             actor['role'] == 'admin'
             or (actor['role'] == 'technician' and row['assignee_id'] == actor['id'])
@@ -409,16 +432,19 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         data = await payload(request)
         token = str(data.get('setup_token', ''))
         if not hmac.compare_digest(token, setup_token):
-            raise HTTPException(403, 'Use the setup link shown in the server window.')
+            raise HTTPException(403, 'Use the private setup token configured for this server.')
         name = text(data.get('name'), 'Name', 100, True)
         email = email_value(data.get('email'))
         encoded = password_hash(validate_password(data.get('password')))
         with db() as conn:
-            write_lock(conn)
+            conn.execute('BEGIN IMMEDIATE')
+            if database.backend == 'postgres':
+                # Serialize first-admin creation across multiple app instances.
+                conn.execute('SELECT pg_advisory_xact_lock(?)', (180018,)).fetchone()
             if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
                 raise HTTPException(409, 'Setup is already complete.')
             cursor = conn.execute("INSERT INTO users(name,email,password_hash,role,created_at) VALUES (?,?,?,'admin',?) RETURNING id", (name, email, encoded, utcnow()))
-            account = conn.execute('SELECT * FROM users WHERE id=?', (cursor.fetchone()[0],)).fetchone()
+            account = conn.execute('SELECT * FROM users WHERE id=?', (cursor.fetchone()['id'],)).fetchone()
         response = JSONResponse({})
         csrf = new_session(account['id'], response, request)
         response.body = json.dumps({'user': safe_user(account), 'csrf': csrf}).encode()
@@ -437,7 +463,6 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         keys = ['email:' + email, 'ip:' + ip]
         now = time.time()
         with db() as conn:
-            write_lock(conn)
             conn.execute('DELETE FROM attempts WHERE first_at < ?', (now - 900,))
             for key in keys:
                 attempt = conn.execute('SELECT * FROM attempts WHERE key=?', (key,)).fetchone()
@@ -507,7 +532,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         try:
             with db() as conn:
                 cur = conn.execute('INSERT INTO users(name,email,password_hash,role,must_change,created_at) VALUES (?,?,?,?,1,?) RETURNING id', (name,email,encoded,role,utcnow()))
-                return {'user': safe_user(conn.execute('SELECT * FROM users WHERE id=?', (cur.fetchone()[0],)).fetchone())}
+                return {'user': safe_user(conn.execute('SELECT * FROM users WHERE id=?', (cur.fetchone()['id'],)).fetchone())}
         except INTEGRITY_ERRORS:
             raise HTTPException(409, 'An account with this email already exists.')
 
@@ -516,8 +541,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         actor = user(request, admin=True)
         data = await payload(request)
         with db() as conn:
-            write_lock(conn)
-            target = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            conn.execute('BEGIN IMMEDIATE')
+            suffix = ' FOR UPDATE' if database.backend == 'postgres' else ''
+            target = conn.execute('SELECT * FROM users WHERE id=?' + suffix, (user_id,)).fetchone()
             if not target:
                 raise HTTPException(404, 'Account not found.')
             active = data.get('active', bool(target['active']))
@@ -571,7 +597,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             check_assignee(conn, data['assignee_id'])
             fields = list(data)
             cur = conn.execute('INSERT INTO jobs(' + ','.join(fields) + ',created_by,created_at,updated_at,completed_at) VALUES (' + ','.join(['?']*(len(fields)+4)) + ') RETURNING id', [data[f] for f in fields] + [actor['id'],now,now,now if data['status']=='Completed' else None])
-            job_id = cur.fetchone()[0]
+            job_id = cur.fetchone()['id']
             log(conn, job_id, actor['id'], 'created', 'Submitted this request.' if actor['role']=='requester' else 'Created this job.')
             if actor['role'] == 'requester':
                 for admin in conn.execute("SELECT id FROM users WHERE role='admin' AND active=1"):
@@ -602,8 +628,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             if 'status' in incoming and incoming['status'] not in TECHNICIAN_STATUSES:
                 raise HTTPException(403, 'Technicians can select In Progress, On Hold, or Completed.')
         with db() as conn:
-            write_lock(conn)
-            old = job_access(conn,job_id,actor)
+            conn.execute('BEGIN IMMEDIATE')
+            old = job_access(conn,job_id,actor,lock=True)
             if old['archived']:
                 raise HTTPException(400, 'Restore this job before editing it.')
             if incoming.get('version') != old['version']:
@@ -640,7 +666,6 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         if not isinstance(archived,bool):
             raise HTTPException(400,'Archived must be true or false.')
         with db() as conn:
-            write_lock(conn)
             job_access(conn,job_id,actor)
             conn.execute('UPDATE jobs SET archived=?,updated_at=?,version=version+1 WHERE id=?',(int(archived),utcnow(),job_id))
             log(conn,job_id,actor['id'],'archived','Archived this job.' if archived else 'Restored this job.')
@@ -659,11 +684,6 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             notify_job_participants(conn,job,f'{actor["name"]} commented on {job["title"]}',actor['id'])
         return {'ok':True}
 
-    @app.get('/api/storage/usage')
-    def storage_usage(request: Request):
-        user(request, admin=True)
-        return {**photo_limits.usage(), 'backend': photo_storage.backend}
-
     @app.post('/api/jobs/{job_id}/photos')
     async def add_photos(job_id: int, request: Request):
         actor = user(request)
@@ -671,53 +691,61 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             job = job_access(conn,job_id,actor)
             if job['archived']:
                 raise HTTPException(400,'Restore this job before adding photos.')
-        photo_limits.upload_attempt(actor['id'])
-        with photo_limits.processing():
-            processed = []
-            async with request.form(max_files=8,max_fields=4,max_part_size=10000) as form:
-                phase = choice(str(form.get('phase','Before')),('Before','After','General'),'photo type')
-                if actor['role'] == 'requester' and phase == 'After':
-                    raise HTTPException(403, 'Requesters can add Before or General photos; After photos document technician work.')
-                caption = text(form.get('caption'),'Caption',500)
-                files = form.getlist('files')
-                if not files or len(files)>8 or any(not isinstance(f,UploadFile) for f in files):
-                    raise HTTPException(400,'Choose 1 to 8 image files.')
-                photo_limits.upload_photos(actor['id'], len(files))
-                for item in files:
-                    raw = await item.read(MAX_PHOTO+1)
-                    if len(raw)>MAX_PHOTO:
-                        raise HTTPException(400,'Each photo must be 12 MB or smaller.')
-                    content = await run_in_threadpool(compress_photo, raw, photo_limits.max_stored,
-                                                     photo_limits.max_dimension, photo_limits.quality)
-                    processed.append((secrets.token_hex(24)+'.webp',
-                                      text(item.filename,'Filename',255) or 'photo.webp',content))
-            reservation = photo_limits.reserve(job_id, [len(content) for _,_,content in processed])
-            written = []
-            try:
+        processed = []
+        async with request.form(max_files=8,max_fields=4,max_part_size=10000) as form:
+            phase = choice(str(form.get('phase','Before')),('Before','After','General'),'photo type')
+            if actor['role'] == 'requester' and phase == 'After':
+                raise HTTPException(403, 'Requesters can add Before or General photos; After photos document technician work.')
+            caption = text(form.get('caption'),'Caption',500)
+            files = form.getlist('files')
+            if not files or len(files)>8 or any(not isinstance(f,UploadFile) for f in files):
+                raise HTTPException(400,'Choose 1 to 8 image files.')
+            for item in files:
+                raw = await item.read(MAX_PHOTO+1)
+                if len(raw)>MAX_PHOTO:
+                    raise HTTPException(400,'Each photo must be 12 MB or smaller.')
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('error',Image.DecompressionBombWarning)
+                        with Image.open(io.BytesIO(raw)) as source:
+                            if source.format not in ('JPEG','PNG','WEBP'):
+                                raise HTTPException(400,'Use JPG, PNG or WebP images. Convert HEIC photos to JPG first.')
+                            source.load()
+                            image=ImageOps.exif_transpose(source)
+                            image.thumbnail((2400,2400))
+                            if image.mode in ('RGBA','LA') or 'transparency' in image.info:
+                                rgba=image.convert('RGBA')
+                                background=Image.new('RGB',image.size,'white')
+                                background.paste(rgba,mask=rgba.getchannel('A'))
+                                image=background
+                            else:
+                                image=image.convert('RGB')
+                            output=io.BytesIO()
+                            image.save(output,format='JPEG',quality=86,optimize=True)
+                            processed.append((secrets.token_hex(24)+'.jpg',text(item.filename,'Filename',255) or 'photo.jpg',output.getvalue()))
+                except (UnidentifiedImageError,OSError,ValueError,Image.DecompressionBombError,Image.DecompressionBombWarning):
+                    raise HTTPException(400,'Invalid image or image is larger than 24 megapixels. Resize it and try again.')
+        written=[]
+        try:
+            with db() as conn:
+                # Recheck permissions in case the assignment changed while uploading.
+                fresh=job_access(conn,job_id,actor)
+                if fresh['archived']:
+                    raise HTTPException(400,'This job has been archived.')
                 for filename,original,content in processed:
-                    reference = await run_in_threadpool(photo_storage.put, filename, content)
-                    written.append(reference)
-                with db() as conn:
-                    write_lock(conn)
-                    fresh = job_access(conn,job_id,actor)
-                    if fresh['archived']:
-                        raise HTTPException(400,'This job has been archived.')
-                    for reference,(_,original,content) in zip(written,processed):
-                        conn.execute('INSERT INTO photos(job_id,filename,original_name,phase,caption,uploaded_by,created_at,stored_bytes) VALUES (?,?,?,?,?,?,?,?)',
-                                     (job_id,reference,original,phase,caption,actor['id'],utcnow(),len(content)))
-                    log(conn,job_id,actor['id'],'photos',f'Added {len(processed)} {phase.lower()} photo(s).')
-                    notify_job_participants(conn,fresh,f'{actor["name"]} added photos to {fresh["title"]}',actor['id'])
-                    conn.execute('DELETE FROM photo_reservations WHERE token=?', (reservation,))
-            except Exception as exc:
-                cleaned = not (isinstance(exc, StorageUnavailable) and exc.cleanup_failed)
-                for reference in written:
-                    removed = await run_in_threadpool(photo_storage.cleanup, reference)
-                    cleaned = cleaned and removed
-                # Keep the reservation if cleanup failed. Never undercount possible orphan objects.
-                if cleaned:
-                    photo_limits.release(reservation)
-                raise
-            return {'ok':True,'count':len(processed)}
+                    photo_store.put(filename,content)
+                    written.append(filename)
+                    conn.execute('INSERT INTO photos(job_id,filename,original_name,phase,caption,uploaded_by,created_at) VALUES (?,?,?,?,?,?,?)',(job_id,filename,original,phase,caption,actor['id'],utcnow()))
+                log(conn,job_id,actor['id'],'photos',f'Added {len(processed)} {phase.lower()} photo(s).')
+                notify_job_participants(conn,fresh,f'{actor["name"]} added photos to {fresh["title"]}',actor['id'])
+        except Exception:
+            for filename in written:
+                try:
+                    photo_store.delete(filename)
+                except Exception:
+                    pass
+            raise
+        return {'ok':True,'count':len(processed)}
 
     @app.get('/photos/{photo_id}')
     def photo(photo_id: int, request: Request):
@@ -727,24 +755,26 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             if not record:
                 raise HTTPException(404,'Photo not found.')
             job_access(conn,record['job_id'],actor)
-        photo_limits.read_attempt(actor['id'])
-        return photo_storage.response(record['filename'])
+        content=photo_store.get(record['filename'])
+        if content is None:
+            raise HTTPException(404,'Photo file not found. Check the server backup.')
+        return Response(content,media_type='image/jpeg')
 
     @app.delete('/api/photos/{photo_id}')
     def delete_photo(photo_id: int, request: Request):
         actor=user(request,admin=True)
         with db() as conn:
-            write_lock(conn)
             record=conn.execute('SELECT * FROM photos WHERE id=?',(photo_id,)).fetchone()
             if not record:
                 raise HTTPException(404,'Photo not found.')
             job=job_access(conn,record['job_id'],actor)
             if job['archived']:
                 raise HTTPException(400,'Restore this job before deleting photos.')
-            # Keep the row if R2 rejects deletion, so the administrator can retry.
-            photo_storage.delete(record['filename'])
             conn.execute('DELETE FROM photos WHERE id=?',(photo_id,))
             log(conn,record['job_id'],actor['id'],'photos','Removed a photo.')
+            # Keep the metadata transaction open until object deletion succeeds.
+            # A temporary R2 error therefore leaves the photo visible for retry.
+            photo_store.delete(record['filename'])
         return {'ok':True}
 
     @app.get('/api/notifications')

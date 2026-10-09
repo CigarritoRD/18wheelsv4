@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+.tmp
+.pytest_cache
+**/__pycache__
+**/*.pyc
+data
+backups
+supabase/.temp
+*.bundle

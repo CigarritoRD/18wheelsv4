@@ -7,18 +7,6 @@ and tracking progress. Updated October 5, 2026 with Admin, Technician, and Reque
 The included demonstration is a different, local-only way to try the interface.
 No company files, employee roster, or production records were imported.
 
-## Deploy on Render Free with Supabase and R2
-
-Follow **[the Supabase deployment guide in Spanish](docs/SUPABASE_SETUP_ES.md)**. This package
-now supports PostgreSQL through `DATABASE_URL`, with persistent users, jobs,
-sessions, setup token, photo counters and capacity reservations. Keep R2 private.
-`render.yaml` defines one Free Docker web service and requests secrets in Render.
-No persistent disk or Render database is needed. Render refuses to start with
-local SQLite or local photo storage, to prevent losing data on an ephemeral disk.
-
-Without `DATABASE_URL`, local usage continues to use SQLite. Existing SQLite
-files are not automatically imported into Supabase; this guide starts a new database.
-
 ## Try the interface immediately
 
 Open **18wheelers-preview.html** in Chrome, Edge, Safari, or Firefox. There is no
@@ -61,6 +49,11 @@ After initial setup, the local address is **http://127.0.0.1:8080**.
 The local address works only on the computer running the server. It is not an
 internet address that you can send to employees. Shared access is explained in
 `docs/DEPLOYMENT.md`.
+
+For the cloud-ready layout added to this edition—Supabase Postgres, a private
+Cloudflare R2 photo bucket, and a separately hosted FastAPI container—follow
+`docs/CLOUD_DEPLOYMENT.md`. Local startup still defaults to SQLite and local files,
+so existing trials and the test suite do not require cloud accounts.
 
 If the browser does not open automatically, copy the setup link shown in the
 server window. The first-time setup token is private; do not share it. If port
@@ -158,12 +151,12 @@ other documents are not supported.
   32 MB total request limit on the server.
 - Images over 24 megapixels are rejected. Resize them first.
 - Uploaded files are decoded, orientation-corrected, resized to a maximum
-  1600-pixel long edge initially, and re-encoded as WebP (up to 300 KiB by default). The server may reduce dimensions further to fit the limit.
+  2400-pixel long edge, and re-encoded as JPEG.
 - Embedded metadata, including GPS information, is removed by re-encoding.
 - The uploaded original is not retained. Keep separate originals if evidence
   preservation or full-resolution images are necessary for your business.
 - Before, After, and General labels organize the photos.
-- Photos use private local storage or a private Cloudflare R2 bucket and require job authorization to view. Upload quotas apply on the server; see docs/R2_SETUP_ES.md.
+- Photos are stored privately on the server and require job authorization to view.
 
 The standard phone file chooser can offer the camera or photo library; the exact
 choices depend on the device and browser. Direct camera APIs are not required.
@@ -177,7 +170,7 @@ SameSite=Lax; the database stores a hash of the session token. Sessions expire
 after 12 hours; pre-login sessions after 30 minutes. Password changes and resets
 revoke older sessions. Mutations require a per-session CSRF token.
 
-Login throttling is persisted in the database: 10 attempts per account and 60 attempts
+Login throttling is persisted in the configured database: 10 attempts per account and 60 attempts
 per connecting IP in a 15-minute window. When behind a reverse proxy, the built-in
 launcher intentionally does not trust forwarded client-IP headers; the IP limit
 may therefore apply across the proxy. See the deployment notes for implications.
@@ -194,17 +187,11 @@ the host, and keep dependencies patched before wider or internet-facing use.
 
 ## Backups and recovery
 
-For PostgreSQL/Neon, use `pg_dump` or the provider's export tools and back up R2
-separately. The SQLite backup command below deliberately refuses to run when
-`DATABASE_URL` is set. Password reset supports either database with the same
-environment variables as the server. Render Free has no shell; run maintenance
-from a trusted machine with those environment variables.
-
-For local SQLite deployments:
-
-The entire `data/` folder is important: it contains `jobs.sqlite3`, `uploads/`,
-and the private setup token. Store it on a persistent disk, not an ephemeral
-hosting filesystem.
+For a local SQLite installation, the entire `data/` folder is important: it
+contains `jobs.sqlite3`, `uploads/`, and the private setup token. Store it on a
+persistent disk, not an ephemeral hosting filesystem. Cloud deployments use
+Supabase and R2 instead; see `docs/CLOUD_DEPLOYMENT.md` for their separate backup
+and restore requirements.
 
 Stop the server, then run:
 
@@ -242,15 +229,6 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-PostgreSQL integration checks use isolated schemas in a disposable test database:
-
-```sh
-EW_TEST_POSTGRES_URL=postgresql://USER:PASSWORD@TEST_HOST/TEST_DATABASE python -m pytest tests/test_postgres.py -q
-```
-
-Never use a production URL for tests. Without this variable, PostgreSQL tests
-are skipped. The current validation report is `docs/render-test-results.txt`.
-
 **45 backend tests passed**: the original 28 regression tests and 17 added tests
 covering all three roles, requester isolation, privileged-field tampering,
 assignment restrictions, notifications, image access, role changes, archived
@@ -272,16 +250,14 @@ hosted; the server app has not been deployed to your domain or connected to your
 email. SMS, email invitations, mobile push notifications, signatures, GPS,
 recurring jobs, multiple assignees, offline synchronization, billing, SSO, MFA,
 and formal completion approval are not implemented. In-app notifications require
-opening the app. Photo quotas and rate limits are implemented on the server;
-there is no automatic retention policy or backup scheduler. The host
-administrator must manage backups and provider usage.
+opening the app. There is no storage quota, retention policy, or automated backup
+scheduler; the host administrator must manage disk usage and backups.
 
-SQLite and filesystem uploads are intended for a small deployment with one app
-instance on a persistent disk. This release was not load-tested at enterprise
-scale. Do not scale it across multiple hosts with separate disks and expect
-synchronization. The Render configuration uses shared PostgreSQL and R2; keep
-one Free web service for this pilot. Storage and relational data do not share
-an atomic transaction, so failed cleanup can require manual reconciliation.
+The local SQLite/filesystem mode is intended for a small deployment with one app
+instance on a persistent disk. The hosted mode uses shared Supabase Postgres and
+Cloudflare R2 storage, but this release still has not been load-tested at
+enterprise scale. Keep the FastAPI database pool deliberately small and load-test
+before increasing instance count.
 
 ## Project layout
 
@@ -291,15 +267,16 @@ start_windows.bat        Windows first-run installer / launcher
 start_mac_linux.sh       macOS / Linux launcher
 run.py                   Uvicorn application launcher
 admin.py                 Backup and account-recovery utilities
-app/server.py            FastAPI, authentication and photo endpoints
-app/database.py          SQLite/PostgreSQL connections and serialized writes
-render.yaml              Render Free service and secret configuration
+app/server.py            FastAPI, authentication, authorization, and endpoints
+app/database.py          SQLite / Supabase Postgres database adapters
+app/photo_storage.py     Local / Cloudflare R2 private photo adapters
 app/static/              Responsive HTML, CSS and JavaScript
 requirements.txt         Versions used for the tested app
 requirements-dev.txt     Backend test dependencies
 tests/                  45 backend tests, including three-role and migration tests
 tools/                   Preview adapter, builder, and optional browser checks
 docs/                    Deployment guide, test report, and screenshots
+supabase/                Supabase CLI config and versioned database migrations
 Dockerfile               Optional container build template
 ```
 

@@ -1,5 +1,9 @@
 # Shared access and deployment
 
+This file describes the original single-server SQLite deployment. For the
+recommended hosted layout using Supabase Postgres and private Cloudflare R2 photo
+storage, use `CLOUD_DEPLOYMENT.md`.
+
 ## Current delivery state
 
 The code, launchers, and standalone preview are complete. There is **no live public
@@ -83,7 +87,7 @@ reviewed for a separate frontend domain.
 
 ## Optional container template
 
-The Dockerfile prepares the mounted data directory as root, then drops to UID/GID 10001 before starting the app. It expects a persistent `/data` volume. See R2_SETUP_ES.md for step-by-step Railway setup.
+The Dockerfile uses a non-root app user and expects a persistent `/data` volume.
 For a local-only container trial:
 
 ```sh
@@ -107,7 +111,7 @@ accounts, verify that technicians see only assigned work and requesters see only
 their own submissions, upload test images,
 check the actual phones your staff use, and rehearse backup/restore. Review
 privacy and retention practices for job photos. Confirm whether retaining only
-compressed WebP images is appropriate; the app does not preserve originals.
+resized JPEGs is appropriate; the app does not preserve originals.
 
 Before broader deployment: review the code and host security, patch dependencies,
 use HTTPS, ensure the data disk is persistent, establish recovery procedures,
