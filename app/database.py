@@ -25,23 +25,23 @@ def connection_failure(error):
     state = getattr(error, 'sqlstate', None)
     detail = str(error).lower()
     if state == '28P01' or 'password authentication failed' in detail:
-        return 'DB_AUTH: PostgreSQL rejected the username/password. Copy a fresh Neon connection URL with the actual password into DATABASE_URL.'
+        return 'DB_AUTH: PostgreSQL rejected the username/password. Copy the Supabase Session pooler URL with the actual encoded password into DATABASE_URL.'
     if 'channel binding' in detail:
-        return 'DB_CHANNEL_BINDING: The connection failed its channel-binding requirement. Check the SSL parameters in the Neon connection URL.'
+        return 'DB_CHANNEL_BINDING: The connection failed its channel-binding requirement. Check the SSL parameters in DATABASE_URL.'
     if any(part in detail for part in ('could not translate host name', 'name or service not known', 'name resolution', 'nodename nor servname')):
-        return 'DB_DNS: The database hostname could not be resolved. Check that DATABASE_URL contains the exact Neon hostname.'
+        return 'DB_DNS: The database hostname could not be resolved. Check that DATABASE_URL contains the exact Supabase pooler hostname.'
     if state == '3D000' or ('database' in detail and 'does not exist' in detail):
-        return 'DB_DATABASE: The requested database does not exist. Copy the URL for the correct database from Neon Connect.'
+        return 'DB_DATABASE: The requested database does not exist. Copy the URL for the correct database from Supabase Connect.'
     if state == '53300' or any(part in detail for part in ('too many connections', 'too many clients', 'remaining connection slots')):
-        return 'DB_CONNECTION_LIMIT: PostgreSQL has reached its connection limit. Use the Neon pooled URL and check active connections.'
+        return 'DB_CONNECTION_LIMIT: PostgreSQL has reached its connection limit. Use the Supabase pooler URL and check active connections.'
     if any(part in detail for part in ('quota', 'compute time', 'endpoint is disabled', 'compute is disabled', 'suspended')):
-        return 'DB_SERVICE_LIMIT: The database service reports a quota or availability restriction. Check the Neon project status and usage.'
+        return 'DB_SERVICE_LIMIT: The database service reports a quota or availability restriction. Check the Supabase project status and usage.'
     if any(part in detail for part in ('invalid connection option', 'invalid uri', 'invalid percent-encoded', 'missing "="', 'invalid integer value')):
         return 'DB_URL: DATABASE_URL could not be parsed. Paste only the full PostgreSQL URL, without a command, quotes or extra text.'
     if any(part in detail for part in ('timeout', 'timed out')):
-        return 'DB_TIMEOUT: The connection timed out. Check the Neon compute status, hostname and network availability, then retry.'
+        return 'DB_TIMEOUT: The connection timed out. Check the Supabase project status, hostname and network availability, then retry.'
     if any(part in detail for part in ('connection refused', 'network is unreachable', 'no route to host')):
-        return 'DB_NETWORK: The database endpoint could not be reached. Check the Neon hostname, port and compute status.'
+        return 'DB_NETWORK: The database endpoint could not be reached. Check the Supabase pooler hostname, port and project status.'
     # libpq may mention SSL even when the underlying failure is a timeout or
     # a closed socket. Never treat the presence of "SSL" as a root cause.
     signatures = (
@@ -56,13 +56,13 @@ def connection_failure(error):
     )
     for code, fragments, explanation in signatures:
         if any(fragment in detail for fragment in fragments):
-            return f'{code}: {explanation} Keep the Neon SSL parameters; check the endpoint and deployment settings.'
+            return f'{code}: {explanation} Keep the PostgreSQL SSL parameters; check the endpoint and deployment settings.'
     if any(part in detail for part in ('ssl', 'tls', 'certificate')):
         return 'DB_SSL_UNKNOWN: The driver reported an unrecognized SSL-related failure. Keep sslmode=require; further driver diagnostics are needed.'
     if state == '28000' or any(part in detail for part in ('no pg_hba', 'role', 'access denied')):
-        return 'DB_ACCESS: PostgreSQL rejected access for the configured role. Check the role and connection settings in Neon.'
+        return 'DB_ACCESS: PostgreSQL rejected access for the configured role. Check the role and connection settings in Supabase.'
     code = f' SQLSTATE={state}.' if isinstance(state, str) and re.fullmatch(r'[A-Z0-9]{5}', state) else ''
-    return 'DB_CONNECT: PostgreSQL connection failed. Check DATABASE_URL and the Neon project status.' + code
+    return 'DB_CONNECT: PostgreSQL connection failed. Check DATABASE_URL and the Supabase project status.' + code
 
 
 class Row(dict):
@@ -121,6 +121,9 @@ class Database:
         self.path = path
         self.url = os.environ.get('DATABASE_URL', '').strip()
         self.backend = 'postgres' if self.url else 'sqlite'
+        self.schema = os.environ.get('EW_DB_SCHEMA', 'app_private' if os.environ.get('RENDER') == 'true' else '').strip()
+        if self.schema and self.schema != 'app_private':
+            raise ValueError('EW_DB_SCHEMA must be app_private or unset.')
         if self.url and not self.url.startswith(('postgresql://', 'postgres://')):
             raise ValueError('DATABASE_URL must be a PostgreSQL connection URL.')
         if os.environ.get('RENDER') == 'true':
@@ -138,6 +141,8 @@ class Database:
             except psycopg.Error as error:
                 raise RuntimeError(connection_failure(error)) from None
             with conn:
+                if self.schema:
+                    conn.execute('SET LOCAL search_path TO app_private, pg_catalog')
                 conn.execute("SET LOCAL statement_timeout = '20s'")
                 conn.execute("SET LOCAL lock_timeout = '15s'")
                 yield PostgresConnection(conn)
@@ -173,9 +178,16 @@ class Database:
         schema = re.sub(r'\bREAL\b', 'DOUBLE PRECISION', schema)
         with self() as conn:
             write_lock(conn)
-            for statement in schema.split(';'):
-                if statement.strip():
-                    conn.execute(statement)
-            conn.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            if self.schema:
+                required = ('users', 'sessions', 'attempts', 'jobs', 'photos', 'activity',
+                            'notifications', 'app_settings', 'photo_reservations', 'photo_counters')
+                for table in required:
+                    if conn.execute('SELECT to_regclass(?)', ('app_private.' + table,)).fetchone()[0] is None:
+                        raise RuntimeError('Apply the Supabase migrations before starting the server.')
+            else:
+                for statement in schema.split(';'):
+                    if statement.strip():
+                        conn.execute(statement)
+                conn.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
             conn.execute("INSERT INTO app_settings(key,value) VALUES ('setup_token',?) ON CONFLICT(key) DO NOTHING", (secrets.token_urlsafe(32),))
             return conn.execute("SELECT value FROM app_settings WHERE key='setup_token'").fetchone()[0]

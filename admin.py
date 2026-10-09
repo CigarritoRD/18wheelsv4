@@ -46,8 +46,13 @@ def main():
         destination.mkdir(parents=True,exist_ok=True)
         # A stopped server and SQLite backup API avoid copying a partial WAL state.
         snapshot=destination/'.snapshot.sqlite3'
-        with sqlite3.connect(store/'jobs.sqlite3') as source:
-            with sqlite3.connect(snapshot) as target:source.backup(target)
+        source=sqlite3.connect(store/'jobs.sqlite3')
+        target=sqlite3.connect(snapshot)
+        try:
+            with target:source.backup(target)
+        finally:
+            target.close()
+            source.close()
         archive=destination/('18wheelers-backup-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.zip')
         try:
             with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:

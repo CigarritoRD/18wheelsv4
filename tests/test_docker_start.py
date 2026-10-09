@@ -8,12 +8,13 @@ import pytest
 from docker_start import prepare_data_directory
 
 
+@pytest.mark.skipif(sys.platform != 'linux', reason='Container paths are Linux-specific')
 def test_refuses_root_directory():
     with pytest.raises(ValueError):
         prepare_data_directory(Path('/'))
 
 
-@pytest.mark.skipif(os.geteuid() != 0 or int(Path('/proc/self/uid_map').read_text().split()[2]) < 10002, reason='Runtime does not map UID 10001; container privilege change cannot be exercised here')
+@pytest.mark.skipif(sys.platform != 'linux' or os.geteuid() != 0 or not Path('/proc/self/uid_map').exists() or int(Path('/proc/self/uid_map').read_text().split()[2]) < 10002, reason='Runtime does not map UID 10001; container privilege change cannot be exercised here')
 def test_root_owned_volume_becomes_writable_after_privilege_drop():
     folder = Path(tempfile.mkdtemp(prefix='18w-volume-', dir='/tmp'))
     try:

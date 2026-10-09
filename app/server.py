@@ -784,6 +784,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
 
     @app.get('/health')
     def health():
+        with db() as conn:
+            conn.execute('SELECT 1').fetchone()
         return {'status':'ok'}
 
     @app.get('/')

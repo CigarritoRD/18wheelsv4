@@ -7,9 +7,9 @@ and tracking progress. Updated October 5, 2026 with Admin, Technician, and Reque
 The included demonstration is a different, local-only way to try the interface.
 No company files, employee roster, or production records were imported.
 
-## Deploy on Render Free with Neon and R2
+## Deploy on Render Free with Supabase and R2
 
-Follow **[the Spanish deployment guide](docs/RENDER_SETUP_ES.md)**. This package
+Follow **[the Supabase deployment guide in Spanish](docs/SUPABASE_SETUP_ES.md)**. This package
 now supports PostgreSQL through `DATABASE_URL`, with persistent users, jobs,
 sessions, setup token, photo counters and capacity reservations. Keep R2 private.
 `render.yaml` defines one Free Docker web service and requests secrets in Render.
@@ -17,7 +17,7 @@ No persistent disk or Render database is needed. Render refuses to start with
 local SQLite or local photo storage, to prevent losing data on an ephemeral disk.
 
 Without `DATABASE_URL`, local usage continues to use SQLite. Existing SQLite
-files are not automatically imported into Neon; this guide starts a new database.
+files are not automatically imported into Supabase; this guide starts a new database.
 
 ## Try the interface immediately
 

@@ -35,12 +35,15 @@ class PhotoLimits:
             write_lock(conn)
             columns = photo_columns(conn)
             if 'stored_bytes' not in columns:
+                if db.schema:
+                    raise RuntimeError('Apply the Supabase photo quota migration before starting the server.')
                 conn.execute('ALTER TABLE photos ADD COLUMN stored_bytes BIGINT NOT NULL DEFAULT 0')
-            conn.execute('''CREATE TABLE IF NOT EXISTS photo_reservations (
-                token TEXT PRIMARY KEY, job_id INTEGER NOT NULL, bytes_count BIGINT NOT NULL,
-                photo_count INTEGER NOT NULL, created_at DOUBLE PRECISION NOT NULL)''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS photo_counters (
-                key TEXT PRIMARY KEY, used INTEGER NOT NULL, expires DOUBLE PRECISION NOT NULL)''')
+            if not db.schema:
+                conn.execute('''CREATE TABLE IF NOT EXISTS photo_reservations (
+                    token TEXT PRIMARY KEY, job_id INTEGER NOT NULL, bytes_count BIGINT NOT NULL,
+                    photo_count INTEGER NOT NULL, created_at DOUBLE PRECISION NOT NULL)''')
+                conn.execute('''CREATE TABLE IF NOT EXISTS photo_counters (
+                    key TEXT PRIMARY KEY, used INTEGER NOT NULL, expires DOUBLE PRECISION NOT NULL)''')
             # Account for legacy local images. Unknown remote sizes block new uploads.
             for row in conn.execute('SELECT id,filename FROM photos WHERE stored_bytes=0'):
                 if not row['filename'].startswith('r2:'):
